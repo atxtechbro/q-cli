@@ -4,6 +4,14 @@ use std::collections::{
 };
 use std::sync::Arc;
 
+use crossterm::style::Color::{
+    DarkGreen,
+    DarkYellow,
+};
+use crossterm::{
+    execute,
+    style,
+};
 use fig_api_client::model::{
     AssistantResponseMessage,
     ChatMessage,
@@ -26,6 +34,7 @@ use tracing::{
 };
 
 use super::consts::{
+    CONTEXT_FILES_MAX_SIZE,
     MAX_CHARS,
     MAX_CONVERSATION_STATE_HISTORY_LEN,
 };
@@ -58,6 +67,7 @@ use super::tools::{
 const CONTEXT_ENTRY_START_HEADER: &str = "--- CONTEXT ENTRY BEGIN ---\n";
 const CONTEXT_ENTRY_END_HEADER: &str = "--- CONTEXT ENTRY END ---\n\n";
 
+use super::util::drop_matched_context_files;
 /// Tracks state related to an ongoing conversation.
 #[derive(Debug, Clone)]
 pub struct ConversationState {
@@ -310,7 +320,7 @@ impl ConversationState {
         self.history.drain(self.valid_history_range.1..);
         self.history.drain(..self.valid_history_range.0);
 
-        self.backend_conversation_state(run_hooks, false)
+        self.backend_conversation_state(run_hooks, false, true)
             .await
             .into_fig_conversation_state()
             .expect("unable to construct conversation state")
@@ -318,7 +328,12 @@ impl ConversationState {
 
     /// Returns a conversation state representation which reflects the exact conversation to send
     /// back to the model.
-    pub async fn backend_conversation_state(&mut self, run_hooks: bool, quiet: bool) -> BackendConversationState<'_> {
+    pub async fn backend_conversation_state(
+        &mut self,
+        run_hooks: bool,
+        quiet: bool,
+        show_dropped_context_files_warning: bool,
+    ) -> BackendConversationState<'_> {
         self.enforce_conversation_invariants();
 
         // Run hooks and add to conversation start and next user message.
@@ -330,7 +345,6 @@ impl ConversationState {
             } else {
                 Some(self.updates.as_mut().unwrap_or(&mut null_writer))
             };
-
             let hook_results = cm.run_hooks(updates).await;
             conversation_start_context = Some(format_hook_context(hook_results.iter(), HookTrigger::ConversationStart));
 
@@ -340,7 +354,9 @@ impl ConversationState {
             }
         }
 
-        let context_messages = self.context_messages(conversation_start_context).await;
+        let context_messages = self
+            .context_messages(conversation_start_context, show_dropped_context_files_warning)
+            .await;
 
         BackendConversationState {
             conversation_id: self.conversation_id.as_str(),
@@ -399,7 +415,7 @@ impl ConversationState {
             },
         };
 
-        let conv_state = self.backend_conversation_state(false, true).await;
+        let conv_state = self.backend_conversation_state(false, true, false).await;
 
         // Include everything but the last message in the history.
         let history_len = conv_state.history.len();
@@ -482,6 +498,7 @@ impl ConversationState {
     async fn context_messages(
         &mut self,
         conversation_start_context: Option<String>,
+        show_dropped_context_files_warning: bool,
     ) -> Option<Vec<(UserMessage, AssistantMessage)>> {
         let mut context_content = String::new();
 
@@ -497,7 +514,28 @@ impl ConversationState {
         // Add context files if available
         if let Some(context_manager) = self.context_manager.as_mut() {
             match context_manager.get_context_files(true).await {
-                Ok(files) => {
+                Ok(mut files) => {
+                    if let Ok(dropped_files) = drop_matched_context_files(&mut files, CONTEXT_FILES_MAX_SIZE) {
+                        if !dropped_files.is_empty() {
+                            if show_dropped_context_files_warning {
+                                let mut output = SharedWriter::stdout();
+                                execute!(
+                                    output,
+                                    style::SetForegroundColor(DarkYellow),
+                                    style::Print("\nSome context files are dropped due to size limit, please run "),
+                                    style::SetForegroundColor(DarkGreen),
+                                    style::Print("/context show "),
+                                    style::SetForegroundColor(DarkYellow),
+                                    style::Print("to learn more.\n"),
+                                    style::SetForegroundColor(style::Color::Reset)
+                                )
+                                .ok();
+                            }
+                            for (filename, _) in dropped_files.iter() {
+                                files.retain(|(f, _)| f != filename);
+                            }
+                        }
+                    }
                     if !files.is_empty() {
                         context_content.push_str(CONTEXT_ENTRY_START_HEADER);
                         for (filename, content) in files {
@@ -533,7 +571,7 @@ impl ConversationState {
 
     /// Calculate the total character count in the conversation
     pub async fn calculate_char_count(&mut self) -> CharCount {
-        self.backend_conversation_state(false, true).await.char_count()
+        self.backend_conversation_state(false, true, false).await.char_count()
     }
 
     /// Get the current token warning level
