@@ -27,6 +27,7 @@ use super::tools::{
     serde_value_to_document,
 };
 use super::util::truncate_safe;
+use crate::util::images::RichImageBlocks;
 
 const USER_ENTRY_START_HEADER: &str = "--- USER MESSAGE BEGIN ---\n";
 const USER_ENTRY_END_HEADER: &str = "--- USER MESSAGE END ---\n\n";
@@ -104,6 +105,17 @@ impl UserMessage {
                 tool_use_results: results,
             },
             images: None,
+        }
+    }
+
+    pub fn new_tool_use_results_with_images(results: Vec<ToolUseResult>, images: Vec<ImageBlock>) -> Self {
+        Self {
+            additional_context: String::new(),
+            env_context: UserEnvContext::generate_new(),
+            content: UserMessageContent::ToolUseResults {
+                tool_use_results: results,
+            },
+            images: Some(images),
         }
     }
 

@@ -20,6 +20,7 @@ use crossterm::style::Stylize;
 use custom_tool::CustomTool;
 use execute_bash::ExecuteBash;
 use eyre::Result;
+use fig_api_client::model::ImageBlock;
 use fig_os_shim::Context;
 use fs_read::FsRead;
 use fs_write::FsWrite;
@@ -31,6 +32,7 @@ use serde::{
 use use_aws::UseAws;
 
 use super::consts::MAX_TOOL_RESPONSE_SIZE;
+use crate::util::images::RichImageBlocks;
 
 /// Represents an executable tool use.
 #[derive(Debug, Clone)]
@@ -310,7 +312,7 @@ pub fn document_to_serde_value(value: Document) -> serde_json::Value {
 ///
 /// Required since path arguments are defined by the model.
 #[allow(dead_code)]
-fn sanitize_path_tool_arg(ctx: &Context, path: impl AsRef<Path>) -> PathBuf {
+pub fn sanitize_path_tool_arg(ctx: &Context, path: impl AsRef<Path>) -> PathBuf {
     let mut res = PathBuf::new();
     // Expand `~` only if it is the first part.
     let mut path = path.as_ref().components();

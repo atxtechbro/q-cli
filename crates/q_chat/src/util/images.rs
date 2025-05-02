@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use crossterm::execute;
@@ -11,14 +12,18 @@ use fig_api_client::model::{
     ImageFormat,
     ImageSource,
 };
+use fig_os_shim::Context;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 use crate::consts::{
     MAX_IMAGE_SIZE,
     MAX_NUMBER_OF_IMAGES_PER_REQUEST,
 };
-use crate::shared_writer::SharedWriter;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageMetadata {
     pub filepath: String,
     pub size: u64, // in bytes
@@ -29,14 +34,82 @@ pub type RichImageBlocks = Vec<(ImageBlock, ImageMetadata)>;
 
 pub type RichImageBlock = (ImageBlock, ImageMetadata);
 
+pub fn string_to_rich_image_block(value: String) -> RichImageBlock {
+    println!("Converting string to rich image block");
+    let image_block: ImageBlock = serde_json::from_str(&value).unwrap();
+    let image_metadata: ImageMetadata = serde_json::from_str(&value).unwrap();
+
+    println!("Image block: {:?}", image_block);
+    println!("Image metadata: {:?}", image_metadata);
+    (image_block, image_metadata)
+}
+
 /// This is the user facing function that handles the images from the user prompt.
 /// It extracts the images from the user prompt and returns a vector of valid image data.
 ///
 /// Image data is represented as a tuple of (ImageBlock, ImageMetadata).
 ///
 /// It also handles printing necessary information about the images extracted and validation errors.
-pub fn handle_images_from_user_prompt(output: &mut SharedWriter, user_prompt: &str) -> RichImageBlocks {
+pub fn handle_images_from_user_prompt(output: &mut impl Write, user_prompt: &str) -> RichImageBlocks {
     let extracted_images = extract_images_from_user_prompt(user_prompt);
+
+    let (mut valid_images, images_exceeding_size_limit): (RichImageBlocks, RichImageBlocks) = extracted_images
+        .into_iter()
+        .partition(|(_, metadata)| metadata.size as usize <= MAX_IMAGE_SIZE);
+
+    if valid_images.len() > MAX_NUMBER_OF_IMAGES_PER_REQUEST {
+        execute!(
+            &mut *output,
+            style::SetForegroundColor(Color::DarkYellow),
+            style::Print(format!(
+                "\nMore than {} images detected. Extra ones will be dropped.\n",
+                MAX_NUMBER_OF_IMAGES_PER_REQUEST
+            )),
+            style::SetForegroundColor(Color::Reset)
+        )
+        .ok();
+        valid_images.truncate(MAX_NUMBER_OF_IMAGES_PER_REQUEST);
+    }
+
+    if !images_exceeding_size_limit.is_empty() {
+        execute!(
+            &mut *output,
+            style::SetForegroundColor(Color::DarkYellow),
+            style::Print(format!(
+                "\nThe following images are dropped due to exceeding size limit ({}MB):\n",
+                MAX_IMAGE_SIZE / (1024 * 1024)
+            )),
+            style::SetForegroundColor(Color::Reset)
+        )
+        .ok();
+        for (_, metadata) in &images_exceeding_size_limit {
+            let image_size_str = if metadata.size > 1024 * 1024 {
+                format!("{:.2} MB", metadata.size as f64 / (1024.0 * 1024.0))
+            } else if metadata.size > 1024 {
+                format!("{:.2} KB", metadata.size as f64 / 1024.0)
+            } else {
+                format!("{} bytes", metadata.size)
+            };
+            execute!(
+                &mut *output,
+                style::SetForegroundColor(Color::DarkYellow),
+                style::Print(format!("  - {} ({})\n", metadata.filename, image_size_str)),
+                style::SetForegroundColor(Color::Reset)
+            )
+            .ok();
+        }
+    }
+    valid_images
+}
+
+pub fn handle_images_from_paths(output: &mut impl Write, paths: &Vec<String>) -> RichImageBlocks {
+    let user_prompt = paths
+        .iter()
+        .map(|path| format!("'{}'", path))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("User prompt: {}", user_prompt);
+    let extracted_images = extract_images_from_user_prompt(user_prompt.as_str());
 
     let (mut valid_images, images_exceeding_size_limit): (RichImageBlocks, RichImageBlocks) = extracted_images
         .into_iter()
@@ -102,7 +175,6 @@ pub fn extract_images_from_user_prompt(user_prompt: &str) -> Vec<(ImageBlock, Im
             continue;
         }
         seen_args.insert(arg);
-
         if is_supported_image_type(arg) {
             if let Some(image_block) = get_image_block_from_file_path(arg) {
                 let path = arg;
@@ -153,10 +225,11 @@ pub fn get_image_block_from_file_path(maybe_file_path: &str) -> Option<ImageBloc
 
     let file_path = Path::new(maybe_file_path);
     if !file_path.exists() {
+        println!("File does not exist: {}", maybe_file_path);
         return None;
     }
 
-    let image_bytes = fs::read(file_path);
+    let image_bytes = fs::read(file_path.clone());
     if image_bytes.is_err() {
         return None;
     }
@@ -187,6 +260,7 @@ pub fn get_image_format_from_ext(ext: &str) -> Option<ImageFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared_writer::SharedWriter;
 
     #[test]
     fn test_is_supported_image_type() {
@@ -231,6 +305,7 @@ mod tests {
 
         let mut output = SharedWriter::stdout();
         let user_prompt = format!("{}", image_path.to_string_lossy());
+
         let images = handle_images_from_user_prompt(&mut output, &user_prompt);
 
         assert_eq!(images.len(), 1);
@@ -264,6 +339,7 @@ mod tests {
 
         let mut output = SharedWriter::stdout();
         let user_prompt = format!("{}", large_image_path.to_string_lossy());
+
         let images = handle_images_from_user_prompt(&mut output, &user_prompt);
 
         assert!(images.is_empty());
@@ -281,6 +357,7 @@ mod tests {
         }
 
         let mut output = SharedWriter::stdout();
+
         let images = handle_images_from_user_prompt(&mut output, &user_prompt);
 
         assert_eq!(images.len(), MAX_NUMBER_OF_IMAGES_PER_REQUEST);

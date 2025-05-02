@@ -71,6 +71,7 @@ use fig_api_client::StreamingClient;
 use fig_api_client::clients::SendMessageOutput;
 use fig_api_client::model::{
     ChatResponseStream,
+    ImageBlock,
     Tool as FigTool,
     ToolResultStatus,
 };
@@ -161,6 +162,7 @@ use tool_manager::{
 };
 use tools::gh_issue::GhIssueContext;
 use tools::{
+    OutputKind,
     QueuedTool,
     Tool,
     ToolPermissions,
@@ -174,7 +176,11 @@ use tracing::{
     warn,
 };
 use unicode_width::UnicodeWidthStr;
-use util::images::handle_images_from_user_prompt;
+use util::images::{
+    RichImageBlock,
+    handle_images_from_user_prompt,
+    string_to_rich_image_block,
+};
 use util::{
     animate_output,
     play_notification_bell,
@@ -1367,35 +1373,35 @@ impl ChatContext {
                         .append_prompts(prompts)
                         .ok_or(ChatError::Custom("Prompt append failed".into()))?;
                 }
-                let valid_images = handle_images_from_user_prompt(&mut self.output, &user_input);
+                // let valid_images = handle_images_from_user_prompt(&mut self.output, &user_input);
 
                 // Otherwise continue with normal chat on 'n' or other responses
                 self.tool_use_status = ToolUseStatus::Idle;
 
                 if self.interactive {
-                    if !&valid_images.is_empty() {
-                        execute!(
-                            self.output,
-                            style::SetForegroundColor(Color::Cyan),
-                            style::Print("\nImages detected:\n"),
-                            style::SetForegroundColor(Color::Reset)
-                        )?;
-                        for (_, metadata) in &valid_images {
-                            let image_size_str = if metadata.size > 1024 * 1024 {
-                                format!("{:.2} MB", metadata.size as f64 / (1024.0 * 1024.0))
-                            } else if metadata.size > 1024 {
-                                format!("{:.2} KB", metadata.size as f64 / 1024.0)
-                            } else {
-                                format!("{} bytes", metadata.size)
-                            };
-                            execute!(
-                                self.output,
-                                style::SetForegroundColor(Color::Cyan),
-                                style::Print(format!("  - {} ({})\n", metadata.filename, image_size_str)),
-                                style::SetForegroundColor(Color::Reset)
-                            )?;
-                        }
-                    }
+                    // if !&valid_images.is_empty() {
+                    //     execute!(
+                    //         self.output,
+                    //         style::SetForegroundColor(Color::Cyan),
+                    //         style::Print("\nImages detected:\n"),
+                    //         style::SetForegroundColor(Color::Reset)
+                    //     )?;
+                    //     for (_, metadata) in &valid_images {
+                    //         let image_size_str = if metadata.size > 1024 * 1024 {
+                    //             format!("{:.2} MB", metadata.size as f64 / (1024.0 * 1024.0))
+                    //         } else if metadata.size > 1024 {
+                    //             format!("{:.2} KB", metadata.size as f64 / 1024.0)
+                    //         } else {
+                    //             format!("{} bytes", metadata.size)
+                    //         };
+                    //         execute!(
+                    //             self.output,
+                    //             style::SetForegroundColor(Color::Cyan),
+                    //             style::Print(format!("  - {} ({})\n", metadata.filename, image_size_str)),
+                    //             style::SetForegroundColor(Color::Reset)
+                    //         )?;
+                    //     }
+                    // }
                     queue!(self.output, style::SetForegroundColor(Color::Magenta))?;
                     queue!(self.output, style::SetForegroundColor(Color::Reset))?;
                     queue!(self.output, cursor::Hide)?;
@@ -1405,13 +1411,6 @@ impl ChatContext {
 
                 if pending_tool_index.is_some() {
                     self.conversation_state.abandon_tool_use(tool_uses, user_input);
-                } else if !valid_images.is_empty() {
-                    self.conversation_state
-                        .set_next_user_message_with_images(
-                            user_input,
-                            valid_images.clone().into_iter().map(|(image, _)| image).collect(),
-                        )
-                        .await;
                 } else {
                     self.conversation_state.set_next_user_message(user_input).await;
                 }
@@ -2791,6 +2790,7 @@ impl ChatContext {
 
         // Execute the requested tools.
         let mut tool_results = vec![];
+        let mut image_blocks: Vec<RichImageBlock> = Vec::new();
 
         for tool in tool_uses {
             let mut tool_telemetry = self.tool_use_telemetry_events.entry(tool.id.clone());
@@ -2821,6 +2821,29 @@ impl ChatContext {
 
             match invoke_result {
                 Ok(result) => {
+                    match result.output {
+                        OutputKind::Text(ref text) => {
+                            debug!("Output is Text: {}", text);
+                        },
+                        OutputKind::Json(ref json) => {
+                            if let Some(json_arr) = json.as_array() {
+                                for data in json_arr {
+                                    if let Some(rich_image_block_arr) = data.as_array() {
+                                        let image_block_obj = &rich_image_block_arr[0];
+                                        let image_metadata_obj = &rich_image_block_arr[1];
+
+                                        let image_block = serde_json::from_value(image_block_obj.clone())
+                                            .expect("block must match ImageBlock");
+                                        let image_metadata = serde_json::from_value(image_metadata_obj.clone())
+                                            .expect("metadata must match ImageMetadata");
+
+                                        image_blocks.push((image_block, image_metadata));
+                                    }
+                                }
+                            }
+                        },
+                    }
+
                     debug!("tool result output: {:#?}", result);
                     execute!(
                         self.output,
@@ -2840,7 +2863,11 @@ impl ChatContext {
                     }
                     tool_results.push(ToolUseResult {
                         tool_use_id: tool.id,
-                        content: vec![result.into()],
+                        content: if image_blocks.is_empty() {
+                            vec![result.into()]
+                        } else {
+                            vec![]
+                        },
                         status: ToolResultStatus::Success,
                     });
                 },
@@ -2880,7 +2907,13 @@ impl ChatContext {
             }
         }
 
-        self.conversation_state.add_tool_results(tool_results);
+        if !image_blocks.is_empty() {
+            let images = image_blocks.into_iter().map(|(block, _)| block).collect();
+            self.conversation_state
+                .add_tool_results_with_images(tool_results, images);
+        } else {
+            self.conversation_state.add_tool_results(tool_results);
+        }
 
         self.send_tool_use_telemetry().await;
         return Ok(ChatState::HandleResponseStream(
