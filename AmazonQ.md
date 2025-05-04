@@ -17,6 +17,16 @@ When working with file operations in Rust:
 3. Use `serde_json::to_string_pretty()` + `fs::write()` instead of creating a file and then writing to it with `serde_json::to_writer_pretty()`
 4. Keep imports organized by functionality (e.g., group path-related imports together)
 
+## File Formatting
+
+### End of File
+
+All text files should:
+1. End with a proper trailing newline (POSIX requirement)
+2. Include a blank line at the end of the file (visible in source control)
+
+This applies to all source code files, configuration files, and documentation files.
+
 ## Git
 
 ### Committing Changes
